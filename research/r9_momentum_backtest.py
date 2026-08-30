@@ -39,6 +39,7 @@ OVERLAY_REPORT = ROOT / "research" / "artifacts" / "reversal-overlay-report.json
 UNIVERSE_FILE = ROOT / "research" / "universe.json"
 OUTPUT = ROOT / "research" / "artifacts" / "r9-momentum-report.json"
 R91_OUTPUT = ROOT / "research" / "artifacts" / "r9.1-momentum-report.json"
+R92_OUTPUT = ROOT / "research" / "artifacts" / "r9.2-momentum-report.json"
 HOURLY_DAYS = 420
 LONG_FORMATION_DAYS = 30
 SHORT_FORMATION_DAYS = 7
@@ -55,6 +56,8 @@ TRAIL_DISTANCE = 0.025
 DAILY_KILL_LOSS = 0.03
 RANK_EXIT_BUFFER = 6
 MIN_REBALANCE_DELTA = 0.05
+R92_RANK_EXIT_BUFFER = 8
+R92_MIN_REBALANCE_DELTA = 0.10
 ONE_DAY = timedelta(days=1)
 
 
@@ -63,7 +66,7 @@ class StrategyVariant:
     id: str
     name: str
     up_shock_flat: bool = False
-    rank_buffer: bool = False
+    rank_exit_buffer: int = 0
     min_rebalance_delta: float = 0.0
 
 
@@ -72,8 +75,15 @@ R91 = StrategyVariant(
     "r9.1",
     "R9.1 暴涨回避 + 排名缓冲 + 调仓阈值",
     up_shock_flat=True,
-    rank_buffer=True,
+    rank_exit_buffer=RANK_EXIT_BUFFER,
     min_rebalance_delta=MIN_REBALANCE_DELTA,
+)
+R92 = StrategyVariant(
+    "r9.2",
+    "R9.2 扩大排名缓冲 + 提高调仓阈值",
+    up_shock_flat=True,
+    rank_exit_buffer=R92_RANK_EXIT_BUFFER,
+    min_rebalance_delta=R92_MIN_REBALANCE_DELTA,
 )
 
 
@@ -211,11 +221,12 @@ def capped_inverse_vol_weights(volatility: pd.Series, gross: float) -> dict[str,
 def buffered_selection(
     ranked: pd.Series,
     previous_weights: dict[str, float],
+    exit_buffer: int = RANK_EXIT_BUFFER,
 ) -> tuple[list[str], list[str]]:
     ascending = list(ranked.index)
     descending = list(reversed(ascending))
-    long_buffer = set(descending[:RANK_EXIT_BUFFER])
-    short_buffer = set(ascending[:RANK_EXIT_BUFFER])
+    long_buffer = set(descending[:exit_buffer])
+    short_buffer = set(ascending[:exit_buffer])
     retained_longs = [inst_id for inst_id in descending if previous_weights.get(inst_id, 0.0) > 0 and inst_id in long_buffer]
     retained_shorts = [inst_id for inst_id in ascending if previous_weights.get(inst_id, 0.0) < 0 and inst_id in short_buffer]
 
@@ -268,8 +279,8 @@ def target_for_day(
     ranked = score.reindex(volatility.index).dropna().sort_values()
     if len(ranked) < ASSETS_PER_SIDE * 2:
         return {}, {"regime": "INSUFFICIENT_DATA", "tradable": False}
-    if variant.rank_buffer:
-        longs, shorts = buffered_selection(ranked, normalized_previous)
+    if variant.rank_exit_buffer:
+        longs, shorts = buffered_selection(ranked, normalized_previous, variant.rank_exit_buffer)
     else:
         shorts = list(ranked.index[:ASSETS_PER_SIDE])
         longs = list(ranked.index[-ASSETS_PER_SIDE:])
@@ -319,7 +330,7 @@ def target_for_day(
         "grossAfterCap": float(sum(abs(weight) for weight in target.values())),
         "longs": longs,
         "shorts": shorts,
-        "rankBuffer": RANK_EXIT_BUFFER if variant.rank_buffer else None,
+        "rankBuffer": variant.rank_exit_buffer or None,
         "minRebalanceDelta": variant.min_rebalance_delta,
     }
     return target, detail
@@ -692,21 +703,21 @@ def main() -> None:
     hourly = load_hourly(universe, args.refresh)
     daily, closes = build_daily_inputs(hourly)
     funding = load_funding(universe)
-    baseline, _ = evaluate_variant(R9, hourly, daily, closes, funding, args.leverage)
-    candidate, day_details = evaluate_variant(R91, hourly, daily, closes, funding, args.leverage)
+    baseline, _ = evaluate_variant(R91, hourly, daily, closes, funding, args.leverage)
+    candidate, day_details = evaluate_variant(R92, hourly, daily, closes, funding, args.leverage)
     gates = acceptance_gates(candidate)
     report = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "mode": "OFFLINE_BACKTEST_ONLY",
         "leverage": args.leverage,
         "strategy": {
-            "id": "r9.1-liquid-momentum-buffered",
-            "name": "R9.1 流动币动量 + BTC 状态倾斜（降换手版）",
+            "id": "r9.2-liquid-momentum-turnover-light",
+            "name": "R9.2 流动币动量 + BTC 状态倾斜（低换手版）",
             "formation": "60% 30日排名 + 25% 7日排名 + 15% 接近20日高点排名",
-            "selection": f"首次进入多前3/空后3；已有仓位保留到跌出对应前/后6；20日逆波动率权重；单币上限{20 * args.leverage:g}%权益名义本金",
+            "selection": f"首次进入多前3/空后3；已有仓位保留到跌出对应前/后8；20日逆波动率权重；单币上限{20 * args.leverage:g}%权益名义本金",
             "regime": "BTC趋势时75/25倾斜；BTC单日上涨超过20日波动1.5倍时次日空仓；下跌冲击日只做空",
             "risk": "1.5倍ATR止损（3%–6%）；盈利4%后2.5%移动止盈；日内亏损3%组合熔断",
-            "rebalance": "每日00:00 UTC；归一化同方向目标权重变化不足5%不调仓；持有至止损、熔断或退出排名缓冲区",
+            "rebalance": "每日00:00 UTC；归一化同方向目标权重变化不足10%不调仓；持有至止损、熔断或退出排名缓冲区",
         },
         "data": {
             "source": "OKX public market API",
@@ -729,8 +740,8 @@ def main() -> None:
         ],
     }
     leverage_label = f"{args.leverage:g}".replace(".", "-")
-    output = R91_OUTPUT if math.isclose(args.leverage, 1.0) else R91_OUTPUT.with_name(
-        f"r9.1-momentum-{leverage_label}x-report.json"
+    output = R92_OUTPUT if math.isclose(args.leverage, 1.0) else R92_OUTPUT.with_name(
+        f"r9.2-momentum-{leverage_label}x-report.json"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

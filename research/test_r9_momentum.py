@@ -8,6 +8,8 @@ from research.r9_momentum_backtest import (
     BASE_COST,
     MAX_ASSET_WEIGHT,
     Position,
+    R91,
+    R92,
     apply_rebalance_threshold,
     buffered_selection,
     capped_inverse_vol_weights,
@@ -19,6 +21,12 @@ from research.r9_momentum_backtest import (
 
 
 class R9MomentumTests(unittest.TestCase):
+    def test_r92_uses_the_backtested_low_turnover_settings(self) -> None:
+        self.assertEqual(R91.rank_exit_buffer, 6)
+        self.assertAlmostEqual(R91.min_rebalance_delta, 0.05)
+        self.assertEqual(R92.rank_exit_buffer, 8)
+        self.assertAlmostEqual(R92.min_rebalance_delta, 0.10)
+
     def test_public_universe_is_available_without_generated_reports(self) -> None:
         universe = load_universe()
         self.assertIn("BTC-USDT-SWAP", universe)
@@ -52,6 +60,13 @@ class R9MomentumTests(unittest.TestCase):
         previous = {"A1": 0.1, "A8": 0.1, "A9": 0.1}
         longs, _ = buffered_selection(ranked, previous)
         self.assertEqual(longs, ["A9", "A8", "A10"])
+
+    def test_r92_rank_buffer_retains_positions_through_rank_eight(self) -> None:
+        ranked = pd.Series({f"A{rank}": float(rank) for rank in range(1, 13)}).sort_values()
+        previous = {"A5": 0.1, "A8": -0.1}
+        longs, shorts = buffered_selection(ranked, previous, exit_buffer=8)
+        self.assertIn("A5", longs)
+        self.assertIn("A8", shorts)
 
     def test_small_same_side_rebalance_is_ignored_but_exits_are_not(self) -> None:
         target = {"A": 0.18, "C": -0.20}
