@@ -16,8 +16,10 @@ from typing import Any
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
 from live.settings import ROOT, load_dotenv
+from live.backtest import last_result, run_backtest
 import os
 
 
@@ -77,6 +79,22 @@ def state() -> dict[str, Any]:
             "tradingDays": days,
             "stopState": positions,
         }
+
+
+class BacktestRequest(BaseModel):
+    leverage: float = Field(default=2.5, ge=0.25, le=5)
+    window: str = Field(default="week")
+
+
+@app.get("/api/backtest")
+def backtest_get() -> dict[str, Any]:
+    return last_result()
+
+
+@app.post("/api/backtest")
+def backtest_post(body: BacktestRequest) -> dict[str, Any]:
+    window = body.window if body.window in {"week", "year"} else "week"
+    return run_backtest(body.leverage, window)
 
 
 PAGE = r"""
@@ -178,6 +196,14 @@ PAGE = r"""
   .status-pending { color: var(--warn); }
   .muted { color: var(--muted); }
   .detail { color: var(--muted); white-space: normal; max-width: 520px; }
+  .bt-row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
+  .bt-row label { color:var(--muted); font-size:13px; }
+  .bt-row input { width:88px; background:var(--card-2); color:var(--fg); border:1px solid var(--line);
+                  border-radius:8px; padding:6px 8px; font-size:14px; font-variant-numeric:tabular-nums; }
+  button.bt { appearance:none; border:1px solid var(--line); background:var(--card-2); color:var(--fg);
+              border-radius:9px; padding:7px 14px; font-size:13px; cursor:pointer; }
+  button.bt:hover { border-color:var(--accent); color:var(--accent); }
+  button.bt:disabled { opacity:.5; cursor:not-allowed; }
   @media (max-width: 980px) {
     .kpis, .grid-2 { grid-template-columns: 1fr 1fr; }
   }
@@ -206,6 +232,17 @@ PAGE = r"""
     <div class="card kpi"><div class="label">实际杠杆</div><div class="value" id="lev">—</div><div class="hint" id="levHint">总名义 / 权益</div></div>
     <div class="card kpi"><div class="label">运行状态</div><div class="value" id="run">—</div><div class="hint" id="runHint">仓位模式 · 策略</div></div>
   </section>
+  <div class="card">
+    <h2>一键回测</h2>
+    <div class="bt-row">
+      <label>杠杆 <input id="btLev" type="number" min="0.25" max="5" step="0.25" value="2.5"> x</label>
+      <button class="bt" id="btWeek" type="button">回测近一周</button>
+      <button class="bt" id="btYear" type="button">回测近一年</button>
+      <span id="btStatus" class="muted"></span>
+    </div>
+    <p id="btCache" class="muted" style="margin:0 0 10px"></p>
+    <div id="btResult"></div>
+  </div>
   <section class="grid-2">
     <div class="card">
       <h2>当前仓位</h2>
@@ -408,6 +445,74 @@ async function refresh() {
     {label: "说明", get: e => `<span class="detail">${summarize(e.kind, e.payload)}</span>`},
   ], data.events || [], "还没有事件");
 }
+function pct(n) {
+  if (n===null || n===undefined || Number.isNaN(Number(n))) return "—";
+  const v = Number(n) * 100;
+  return (v>=0?"+":"") + v.toFixed(2) + "%";
+}
+function renderBacktest(data) {
+  const cache = data.cache || {};
+  const mb = cache.bytes ? (cache.bytes/1024/1024).toFixed(1) + " MB" : "0 MB";
+  el("btCache").textContent = `缓存 ${cache.coins||0}/${cache.universe||0} 个标的 · ${cache.spanDays||0} 天 · ${mb}`
+    + (cache.fullYear ? " · 已满一年" : " · 未满一年，再点会增量补齐");
+  if (data.error) {
+    el("btStatus").textContent = data.error;
+    return;
+  }
+  if (!data.hasResult && !data.metrics) {
+    el("btStatus").textContent = "还没有跑过。第一次会拉最近的K线，之后只补缺口。";
+    el("btResult").innerHTML = "";
+    return;
+  }
+  const m = data.metrics || {};
+  const label = data.window === "year" ? "近一年" : "近一周";
+  el("btStatus").textContent = data.elapsedSec ? `上次耗时 ${data.elapsedSec}s` : "";
+  const days = (data.recentDays || []).slice().reverse();
+  const dayRows = days.map(d => `<tr>
+      <td>${(d.date||"").slice(0,10)}</td>
+      <td>${REGIME[d.regime]||d.regime||"—"}</td>
+      <td class="${cls(d.netReturn)}">${pct(d.netReturn)}</td>
+      <td>${(d.longs||[]).join(" / ")||"—"}</td>
+      <td>${(d.shorts||[]).join(" / ")||"—"}</td>
+    </tr>`).join("");
+  el("btResult").innerHTML = `
+    <div class="row" style="margin-bottom:12px">
+      <div class="stat"><b class="${cls(m.totalReturn)}">${pct(m.totalReturn)}</b><span>${label} · ${data.leverage}x 收益</span></div>
+      <div class="stat"><b class="neg">${pct(m.maxDrawdown)}</b><span>最大回撤</span></div>
+      <div class="stat"><b>${m.observations||"—"}</b><span>交易日</span></div>
+      <div class="stat"><b>${m.positiveDayShare==null?"—":(m.positiveDayShare*100).toFixed(0)+"%"}</b><span>盈利日占比</span></div>
+    </div>
+    <p class="muted" style="margin:0 0 8px">${data.note||""} 区间 ${(m.start||"").slice(0,10)} → ${(m.end||"").slice(0,10)}</p>
+    <div class="scroll"><table>
+      <tr><th>日期</th><th>状态</th><th>当日</th><th>多</th><th>空</th></tr>
+      ${dayRows || '<tr><td class="empty" colspan="5">没有明细</td></tr>'}
+    </table></div>`;
+}
+async function loadBacktest() {
+  try {
+    const data = await (await fetch("/api/backtest")).json();
+    renderBacktest(data);
+  } catch { el("btStatus").textContent = "回测接口暂时不可用"; }
+}
+async function runBacktest(window) {
+  const leverage = Number(el("btLev").value);
+  el("btWeek").disabled = true; el("btYear").disabled = true;
+  el("btStatus").textContent = "回测进行中（最多约 40 秒，不会后台挂起）…";
+  try {
+    const data = await (await fetch("/api/backtest", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({leverage, window}),
+    })).json();
+    data.hasResult = !!data.ok;
+    renderBacktest(data);
+    if (!data.ok && data.error) el("btStatus").textContent = data.error;
+  } catch { el("btStatus").textContent = "回测失败，请稍后再试"; }
+  finally { el("btWeek").disabled = false; el("btYear").disabled = false; }
+}
+el("btWeek").addEventListener("click", () => runBacktest("week"));
+el("btYear").addEventListener("click", () => runBacktest("year"));
+loadBacktest();
 refresh();
 setInterval(refresh, 15000);
 </script>
