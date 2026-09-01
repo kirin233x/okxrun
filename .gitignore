@@ -48,6 +48,9 @@ next-env.d.ts
 /ml/.venv/
 /ml/artifacts/
 /research/.venv/
-/research/__pycache__/
 /research/data/
+
+# python bytecode, anywhere in the tree
+__pycache__/
+*.py[cod]
 /public/paper-live.json
