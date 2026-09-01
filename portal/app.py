@@ -124,6 +124,7 @@ PAGE = r"""
   h1 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: .02em; }
   .sub { color: var(--muted); font-size: 12px; }
   .spacer { flex: 1; }
+  [hidden] { display: none !important; }
   .pill {
     display: inline-flex; align-items: center; gap: 6px;
     font-size: 12px; padding: 4px 10px; border-radius: 999px;
