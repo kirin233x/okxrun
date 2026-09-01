@@ -82,8 +82,9 @@ def state() -> dict[str, Any]:
 
 
 class BacktestRequest(BaseModel):
-    leverage: float = Field(default=2.5, ge=0.25, le=5)
+    leverage: float = Field(default=2.5, ge=0.25, le=20)
     window: str = Field(default="week")
+    principal: float = Field(default=10000, ge=10, le=1_000_000)
 
 
 @app.get("/api/backtest")
@@ -94,7 +95,7 @@ def backtest_get() -> dict[str, Any]:
 @app.post("/api/backtest")
 def backtest_post(body: BacktestRequest) -> dict[str, Any]:
     window = body.window if body.window in {"week", "year"} else "week"
-    return run_backtest(body.leverage, window)
+    return run_backtest(body.leverage, window, body.principal)
 
 
 PAGE = r"""
@@ -204,6 +205,12 @@ PAGE = r"""
               border-radius:9px; padding:7px 14px; font-size:13px; cursor:pointer; }
   button.bt:hover { border-color:var(--accent); color:var(--accent); }
   button.bt:disabled { opacity:.5; cursor:not-allowed; }
+  .tabs { display:flex; gap:6px; }
+  .tab { appearance:none; border:1px solid var(--line); background:transparent; color:var(--muted);
+         border-radius:999px; padding:5px 14px; font-size:13px; cursor:pointer; }
+  .tab.on { color:var(--fg); background:var(--card); border-color:var(--accent); }
+  .panel[hidden] { display:none !important; }
+  .bt-row input.wide { width:120px; }
   @media (max-width: 980px) {
     .kpis, .grid-2 { grid-template-columns: 1fr 1fr; }
   }
@@ -219,12 +226,17 @@ PAGE = r"""
     <h1>OKX 动量策略</h1>
     <span class="sub">只读监控 · 每 15 秒刷新</span>
   </div>
+  <nav class="tabs">
+    <button type="button" class="tab on" data-tab="live">监控</button>
+    <button type="button" class="tab" data-tab="backtest">回测</button>
+  </nav>
   <span id="mode" class="pill"><span class="dot"></span>加载中</span>
   <span id="halt" class="pill halt" hidden>已紧急停止</span>
   <span class="spacer"></span>
   <span id="updated" class="sub"></span>
 </header>
 <main>
+<div id="panel-live" class="panel">
   <section class="kpis">
     <div class="card kpi"><div class="label">账户权益</div><div class="value" id="eq">—</div><div class="hint" id="eqHint">USDT</div><svg class="spark" id="spark" viewBox="0 0 100 36" preserveAspectRatio="none"></svg></div>
     <div class="card kpi"><div class="label">今日盈亏</div><div class="value" id="pnl">—</div><div class="hint" id="pnlHint">相对开盘权益</div></div>
@@ -232,17 +244,6 @@ PAGE = r"""
     <div class="card kpi"><div class="label">实际杠杆</div><div class="value" id="lev">—</div><div class="hint" id="levHint">总名义 / 权益</div></div>
     <div class="card kpi"><div class="label">运行状态</div><div class="value" id="run">—</div><div class="hint" id="runHint">仓位模式 · 策略</div></div>
   </section>
-  <div class="card">
-    <h2>一键回测</h2>
-    <div class="bt-row">
-      <label>杠杆 <input id="btLev" type="number" min="0.25" max="5" step="0.25" value="2.5"> x</label>
-      <button class="bt" id="btWeek" type="button">回测近一周</button>
-      <button class="bt" id="btYear" type="button">回测近一年</button>
-      <span id="btStatus" class="muted"></span>
-    </div>
-    <p id="btCache" class="muted" style="margin:0 0 10px"></p>
-    <div id="btResult"></div>
-  </div>
   <section class="grid-2">
     <div class="card">
       <h2>当前仓位</h2>
@@ -265,6 +266,22 @@ PAGE = r"""
     <h2>事件日志</h2>
     <div class="scroll"><table id="events"></table></div>
   </div>
+</div>
+<div id="panel-backtest" class="panel" hidden>
+  <div class="card">
+    <h2>回测</h2>
+    <p class="muted" style="margin:0 0 12px">从一周/一年前此刻空仓起步，用你填的本金和杠杆模拟到现在。含开平仓手续费和资金费。K 线增量缓存最多一年。</p>
+    <div class="bt-row">
+      <label>本金 <input id="btPrincipal" class="wide" type="number" min="10" max="1000000" step="1" value="10000"> USDT</label>
+      <label>杠杆 <input id="btLev" type="number" min="0.25" max="20" step="0.25" value="2.5"> x</label>
+      <button class="bt" id="btWeek" type="button">回测近一周</button>
+      <button class="bt" id="btYear" type="button">回测近一年</button>
+      <span id="btStatus" class="muted"></span>
+    </div>
+    <p id="btCache" class="muted" style="margin:0 0 10px"></p>
+    <div id="btResult"></div>
+  </div>
+</div>
 </main>
 <script>
 const KIND = {
@@ -368,6 +385,9 @@ async function refresh() {
 
   el("eq").textContent = fmt(now);
   el("eqHint").textContent = "USDT · 开盘 " + fmt(open);
+  if (now && !el("btPrincipal").dataset.touched) {
+    el("btPrincipal").value = Math.max(10, Math.round(now));
+  }
   el("pnl").textContent = dayPct === null ? "—" : ((dayPct >= 0 ? "+" : "") + fmt(dayPct) + "%");
   el("pnl").className = "value " + (dayPct === null ? "" : cls(dayPct));
   el("pnlHint").textContent = day && day.killed ? "今日熔断已触发" : "相对开盘权益";
@@ -478,11 +498,13 @@ function renderBacktest(data) {
   el("btResult").innerHTML = `
     <div class="row" style="margin-bottom:12px">
       <div class="stat"><b class="${cls(m.totalReturn)}">${pct(m.totalReturn)}</b><span>${label} · ${data.leverage}x 收益</span></div>
+      <div class="stat"><b>${fmt(data.principal)}</b><span>起始本金 USDT</span></div>
+      <div class="stat"><b>${fmt(m.endingEquity)}</b><span>期末权益 USDT</span></div>
       <div class="stat"><b class="neg">${pct(m.maxDrawdown)}</b><span>最大回撤</span></div>
       <div class="stat"><b>${m.observations||"—"}</b><span>交易日</span></div>
-      <div class="stat"><b>${m.positiveDayShare==null?"—":(m.positiveDayShare*100).toFixed(0)+"%"}</b><span>盈利日占比</span></div>
+      <div class="stat"><b class="${cls(m.fundingReturn)}">${pct(m.fundingReturn)}</b><span>资金费</span></div>
     </div>
-    <p class="muted" style="margin:0 0 8px">${data.note||""} 区间 ${(m.start||"").slice(0,10)} → ${(m.end||"").slice(0,10)}</p>
+    <p class="muted" style="margin:0 0 8px">${data.note||""} ${data.fundingIncluded?"已计入资金费。":"资金费缓存还在补，再点一次会更准。"} 区间 ${(m.start||"").slice(0,10)} → ${(m.end||"").slice(0,10)}</p>
     <div class="scroll"><table>
       <tr><th>日期</th><th>状态</th><th>当日</th><th>多</th><th>空</th></tr>
       ${dayRows || '<tr><td class="empty" colspan="5">没有明细</td></tr>'}
@@ -496,13 +518,14 @@ async function loadBacktest() {
 }
 async function runBacktest(window) {
   const leverage = Number(el("btLev").value);
+  const principal = Number(el("btPrincipal").value);
   el("btWeek").disabled = true; el("btYear").disabled = true;
   el("btStatus").textContent = "回测进行中（最多约 40 秒，不会后台挂起）…";
   try {
     const data = await (await fetch("/api/backtest", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({leverage, window}),
+      body: JSON.stringify({leverage, window, principal}),
     })).json();
     data.hasResult = !!data.ok;
     renderBacktest(data);
@@ -512,7 +535,16 @@ async function runBacktest(window) {
 }
 el("btWeek").addEventListener("click", () => runBacktest("week"));
 el("btYear").addEventListener("click", () => runBacktest("year"));
-loadBacktest();
+el("btPrincipal").addEventListener("input", () => { el("btPrincipal").dataset.touched = "1"; });
+document.querySelectorAll(".tab").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const name = btn.dataset.tab;
+    document.querySelectorAll(".tab").forEach(b => b.classList.toggle("on", b===btn));
+    el("panel-live").hidden = name !== "live";
+    el("panel-backtest").hidden = name !== "backtest";
+    if (name === "backtest") loadBacktest();
+  });
+});
 refresh();
 setInterval(refresh, 15000);
 </script>

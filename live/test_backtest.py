@@ -8,10 +8,11 @@ import pandas as pd
 
 from live.backtest import (
     MAX_HOURS,
+    clamp_leverage,
+    evaluate,
     merge_hours,
     trim_hours,
     window_metrics,
-    evaluate,
 )
 
 
@@ -51,14 +52,19 @@ class CacheTests(unittest.TestCase):
 
 
 class MetricsTests(unittest.TestCase):
-    def test_window_uses_the_tail_only(self) -> None:
-        idx = pd.date_range("2026-01-01", periods=30, freq="D", tz="UTC")
-        net = pd.Series([0.01] * 23 + [0.10] * 7, index=idx)
-        frame = pd.DataFrame({"net": net, "price": net, "cost": 0.0, "endGross": 1.0})
-        week = window_metrics(frame, 7)
-        assert week is not None
-        self.assertEqual(week["observations"], 7)
-        self.assertGreater(week["totalReturn"], 0.5)
+    def test_principal_scales_ending_equity(self) -> None:
+        idx = pd.date_range("2026-01-01", periods=7, freq="D", tz="UTC")
+        net = pd.Series([0.01] * 7, index=idx)
+        frame = pd.DataFrame({"net": net, "price": net, "funding": 0.0, "cost": 0.0, "endGross": 1.0})
+        a = window_metrics(frame, 1_000.0)
+        b = window_metrics(frame, 2_000.0)
+        assert a is not None and b is not None
+        self.assertAlmostEqual(a["totalReturn"], b["totalReturn"], places=6)
+        self.assertAlmostEqual(b["endingEquity"] / a["endingEquity"], 2.0, places=4)
+
+    def test_leverage_caps_at_20(self) -> None:
+        self.assertEqual(clamp_leverage(20), 20)
+        self.assertEqual(clamp_leverage(50), 20)
 
 
 class EvaluateTests(unittest.TestCase):
@@ -83,10 +89,17 @@ class EvaluateTests(unittest.TestCase):
             indexed = raw.copy()
             indexed.index = pd.to_datetime(indexed.pop("ts"), unit="ms", utc=True)
             hourly[inst_id] = indexed
-        result = evaluate(hourly, leverage=1.0, window_days=7)
-        self.assertGreater(result["tradedDays"], 5)
+        end = start + timedelta(days=70)
+        result = evaluate(hourly, leverage=1.0, window_days=7, principal=1_000.0, now=end)
+        self.assertGreaterEqual(result["tradedDays"], 5)
+        self.assertLessEqual(result["tradedDays"], 8)
         self.assertIsNotNone(result["metrics"])
-        self.assertEqual(result["metrics"]["observations"], 7)
+        doubled = evaluate(hourly, leverage=1.0, window_days=7, principal=2_000.0, now=end)
+        self.assertAlmostEqual(
+            doubled["metrics"]["endingEquity"] / result["metrics"]["endingEquity"],
+            2.0,
+            places=3,
+        )
 
 
 if __name__ == "__main__":

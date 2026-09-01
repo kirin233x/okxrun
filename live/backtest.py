@@ -37,20 +37,24 @@ from .settings import ROOT
 
 
 CANDLE_API = "https://www.okx.com/api/v5/market/history-candles"
+FUNDING_API = "https://www.okx.com/api/v5/public/funding-rate-history"
 UNIVERSE_FILE = ROOT / "research" / "universe.json"
 MAX_CACHE_DAYS = 365
 MAX_HOURS = MAX_CACHE_DAYS * 24
 WARMUP_DAYS = 40
 PAGE = 100
 PAGES_PER_COIN = 8
+PAGES_FUNDING = 4
 BUDGET_SECONDS = 40.0
 WEEK_HOURS = (WARMUP_DAYS + 14) * 24
 BASE_COST = 0.0006
-STARTING_EQUITY = 10_000.0
+DEFAULT_PRINCIPAL = 10_000.0
 ONE_DAY = timedelta(days=1)
 ONE_HOUR_MS = 3_600_000
 MIN_LEVERAGE = 0.25
-MAX_LEVERAGE = 5.0
+MAX_LEVERAGE = 20.0
+MIN_PRINCIPAL = 10.0
+MAX_PRINCIPAL = 1_000_000.0
 WINDOWS = {"week": 7, "year": 365}
 
 _LOCK = threading.Lock()
@@ -81,6 +85,16 @@ def candle_path(inst_id: str) -> Path:
     return cache_dir() / f"{inst_id.lower()}-1h.csv"
 
 
+def funding_dir() -> Path:
+    path = _state_dir() / "backtest" / "funding"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def funding_path(inst_id: str) -> Path:
+    return funding_dir() / f"{inst_id.lower()}-funding.csv"
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -91,21 +105,31 @@ def clamp_leverage(value: float) -> float:
     return min(MAX_LEVERAGE, max(MIN_LEVERAGE, float(value)))
 
 
-def _request_candles(inst_id: str, after: int | None = None, before: int | None = None) -> list[list[str]]:
-    params = {"instId": inst_id, "bar": "1H", "limit": str(PAGE)}
-    if after is not None:
-        params["after"] = str(after)
-    if before is not None:
-        params["before"] = str(before)
+def clamp_principal(value: float) -> float:
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("本金必须是正数")
+    return min(MAX_PRINCIPAL, max(MIN_PRINCIPAL, float(value)))
+
+
+def _request_json(url: str, params: dict[str, str]) -> dict[str, Any]:
     request = urllib.request.Request(
-        f"{CANDLE_API}?{urllib.parse.urlencode(params)}",
+        f"{url}?{urllib.parse.urlencode(params)}",
         headers={"User-Agent": "okxrun-backtest/1.0", "Connection": "close"},
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         payload = json.load(response)
     if payload.get("code") != "0":
         raise RuntimeError(f"OKX {payload.get('code')}: {payload.get('msg')}")
-    return payload.get("data") or []
+    return payload
+
+
+def _request_candles(inst_id: str, after: int | None = None, before: int | None = None) -> list[list[str]]:
+    params = {"instId": inst_id, "bar": "1H", "limit": str(PAGE)}
+    if after is not None:
+        params["after"] = str(after)
+    if before is not None:
+        params["before"] = str(before)
+    return _request_json(CANDLE_API, params).get("data") or []
 
 
 def _rows_to_frame(rows: dict[int, list[str]]) -> pd.DataFrame:
@@ -139,6 +163,95 @@ def read_cached(inst_id: str) -> pd.DataFrame:
 def write_cached(inst_id: str, frame: pd.DataFrame) -> None:
     trimmed = trim_hours(frame)
     trimmed.to_csv(candle_path(inst_id), index=False)
+
+
+def read_funding(inst_id: str) -> pd.DataFrame:
+    path = funding_path(inst_id)
+    if not path.exists():
+        return pd.DataFrame(columns=["ts", "fundingRate"])
+    frame = pd.read_csv(path)
+    if frame.empty:
+        return pd.DataFrame(columns=["ts", "fundingRate"])
+    return frame.astype({"ts": "int64"}, errors="ignore")
+
+
+def write_funding(inst_id: str, frame: pd.DataFrame) -> None:
+    if frame.empty:
+        return
+    out = frame.drop_duplicates("ts", keep="last").sort_values("ts")
+    floor = _now_ms() - MAX_HOURS * ONE_HOUR_MS
+    out = out[out["ts"] >= floor]
+    out.to_csv(funding_path(inst_id), index=False)
+
+
+def fetch_funding_incremental(inst_id: str, cached: pd.DataFrame, deadline: float) -> pd.DataFrame:
+    collected: dict[int, float] = {}
+    newest_cached = int(cached["ts"].max()) if not cached.empty else None
+    oldest_cached = int(cached["ts"].min()) if not cached.empty else None
+    floor = _now_ms() - MAX_HOURS * ONE_HOUR_MS
+    after: int | None = None
+    for _ in range(PAGES_FUNDING):
+        if time.monotonic() >= deadline:
+            break
+        params = {"instId": inst_id, "limit": str(PAGE)}
+        if after is not None:
+            params["after"] = str(after)
+        try:
+            batch = _request_json(FUNDING_API, params).get("data") or []
+        except (urllib.error.URLError, TimeoutError, RuntimeError):
+            break
+        if not batch:
+            break
+        for row in batch:
+            ts = int(row["fundingTime"])
+            rate = float(row.get("realizedRate") or row.get("fundingRate") or 0)
+            collected[ts] = rate
+        oldest = min(int(row["fundingTime"]) for row in batch)
+        if newest_cached is not None and oldest <= newest_cached and after is None:
+            break
+        if oldest <= floor or len(batch) < PAGE:
+            break
+        after = oldest
+        time.sleep(0.03)
+    if oldest_cached is not None and oldest_cached > floor + ONE_HOUR_MS and time.monotonic() < deadline:
+        after = oldest_cached
+        for _ in range(PAGES_FUNDING):
+            if time.monotonic() >= deadline:
+                break
+            params = {"instId": inst_id, "limit": str(PAGE), "after": str(after)}
+            try:
+                batch = _request_json(FUNDING_API, params).get("data") or []
+            except (urllib.error.URLError, TimeoutError, RuntimeError):
+                break
+            if not batch:
+                break
+            for row in batch:
+                collected[int(row["fundingTime"])] = float(
+                    row.get("realizedRate") or row.get("fundingRate") or 0
+                )
+            oldest = min(int(row["fundingTime"]) for row in batch)
+            if oldest <= floor or len(batch) < PAGE:
+                break
+            after = oldest
+            time.sleep(0.03)
+    if not collected:
+        return cached
+    fresh = pd.DataFrame([{"ts": ts, "fundingRate": rate} for ts, rate in collected.items()])
+    if cached.empty:
+        return fresh
+    return pd.concat([cached, fresh], ignore_index=True)
+
+
+def funding_series(frame: pd.DataFrame) -> pd.Series:
+    if frame.empty:
+        return pd.Series(dtype=float)
+    index = pd.to_datetime(frame["ts"], unit="ms", utc=True)
+    result = pd.Series(frame["fundingRate"].to_numpy(dtype=float), index=index)
+    return result.groupby(level=0).sum().sort_index()
+
+
+def load_funding_from_cache(universe: list[str]) -> dict[str, pd.Series]:
+    return {inst_id: funding_series(read_funding(inst_id)) for inst_id in universe}
 
 
 def trim_hours(frame: pd.DataFrame, max_hours: int = MAX_HOURS) -> pd.DataFrame:
@@ -224,24 +337,33 @@ def fetch_incremental(inst_id: str, cached: pd.DataFrame, deadline: float, targe
 
 
 def sync_cache(universe: list[str], deadline: float) -> dict[str, Any]:
+    remain = max(0.0, deadline - time.monotonic())
+    candle_deadline = time.monotonic() + remain * 0.65
     # First pass: get every coin to ~two months so a week window can run.
     for inst_id in universe:
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= candle_deadline:
             break
         cached = read_cached(inst_id)
-        merged = fetch_incremental(inst_id, cached, deadline, WEEK_HOURS)
+        merged = fetch_incremental(inst_id, cached, candle_deadline, WEEK_HOURS)
         if not merged.empty:
             write_cached(inst_id, merged)
     # Second pass: if time remains, deepen toward the one-year cap.
     for inst_id in universe:
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= candle_deadline:
             break
         cached = read_cached(inst_id)
         if cached.empty or len(cached) >= MAX_HOURS - 24:
             continue
-        merged = fetch_incremental(inst_id, cached, deadline, MAX_HOURS)
+        merged = fetch_incremental(inst_id, cached, candle_deadline, MAX_HOURS)
         if not merged.empty:
             write_cached(inst_id, merged)
+    for inst_id in universe:
+        if time.monotonic() >= deadline:
+            break
+        cached = read_funding(inst_id)
+        merged = fetch_funding_incremental(inst_id, cached, deadline)
+        if not merged.empty:
+            write_funding(inst_id, merged)
     return cache_status(universe)
 
 
@@ -257,6 +379,9 @@ def cache_status(universe: list[str] | None = None) -> dict[str, Any]:
         if not path.exists():
             continue
         bytes_used += path.stat().st_size
+        fund = funding_path(inst_id)
+        if fund.exists():
+            bytes_used += fund.stat().st_size
         frame = read_cached(inst_id)
         if frame.empty:
             continue
@@ -344,6 +469,7 @@ def simulate_day(
     previous_weights: dict[str, float],
     hourly: dict[str, pd.DataFrame],
     atr: pd.DataFrame,
+    funding: dict[str, pd.Series],
     cost_rate: float,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     date = pd.Timestamp(date)
@@ -388,6 +514,7 @@ def simulate_day(
         timestamps = sorted(stamps)
     kill_triggered = False
     stop_count = 0
+    first_timestamp = timestamps[0] if timestamps else None
     last_marks: dict[str, float] = {inst_id: position.entry for inst_id, position in positions.items()}
 
     for timestamp in timestamps:
@@ -407,13 +534,22 @@ def simulate_day(
             positions[inst_id].trough = min(positions[inst_id].trough, float(bar["low"]))
             last_marks[inst_id] = float(bar["close"])
 
+        if first_timestamp is not None and timestamp > first_timestamp:
+            for inst_id in list(active):
+                series = funding.get(inst_id)
+                rate = float(series.get(timestamp, 0.0)) if series is not None and not series.empty else 0.0
+                if rate:
+                    notional = abs(positions[inst_id].quantity * last_marks[inst_id])
+                    positions[inst_id].funding_pnl += -positions[inst_id].direction * notional * rate
+
         realized = sum(position.realized_price_pnl for position in positions.values())
         paid_cost = entry_cost + sum(position.exit_cost for position in positions.values())
+        funding_pnl = sum(position.funding_pnl for position in positions.values())
         unrealized = sum(
             positions[inst_id].direction * positions[inst_id].quantity * (last_marks[inst_id] - positions[inst_id].entry)
             for inst_id in active
         )
-        marked_equity = starting_equity + realized + unrealized - paid_cost
+        marked_equity = starting_equity + realized + unrealized + funding_pnl - paid_cost
         if active and marked_equity <= starting_equity * (1.0 - DAILY_KILL_LOSS):
             for inst_id in list(active):
                 _close(positions[inst_id], last_marks[inst_id], cost_rate, "DAILY_KILL")
@@ -429,8 +565,9 @@ def simulate_day(
         position.realized_price_pnl = position.direction * position.quantity * (last_marks[inst_id] - position.entry)
 
     price_pnl = sum(position.realized_price_pnl for position in positions.values())
+    funding_pnl = sum(position.funding_pnl for position in positions.values())
     cost = entry_cost + sum(position.exit_cost for position in positions.values())
-    ending_equity = starting_equity + price_pnl - cost
+    ending_equity = starting_equity + price_pnl + funding_pnl - cost
     ending_weights = {
         inst_id: positions[inst_id].direction * abs(positions[inst_id].quantity * last_marks[inst_id]) / ending_equity
         for inst_id in carried
@@ -443,6 +580,7 @@ def simulate_day(
     return {
         "net": ending_equity / starting_equity - 1.0,
         "price": price_pnl / starting_equity,
+        "funding": funding_pnl / starting_equity,
         "cost": cost / starting_equity,
         "endGross": float(sum(abs(weight) for weight in ending_weights.values())),
     }, {
@@ -460,21 +598,31 @@ def simulate(
     daily: dict[str, pd.DataFrame],
     closes: pd.DataFrame,
     leverage: float,
+    principal: float,
+    start_at: pd.Timestamp,
+    funding: dict[str, pd.Series] | None = None,
     cost_rate: float = BASE_COST,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    funding = funding or {}
     signals = compute_signals(closes, daily)
     score = signals["score"]
     dates = [date for date in closes.index if date in score.index]  # type: ignore[operator]
-    equity = STARTING_EQUITY
+    equity = principal
     previous_weights: dict[str, float] = {}
     rows: list[dict[str, Any]] = []
     days: list[dict[str, Any]] = []
     atr = signals["atr"]
+    now = pd.Timestamp.now(tz="UTC")
     for date in dates:
+        date = pd.Timestamp(date)
+        if date.tzinfo is None:
+            date = date.tz_localize("UTC")
+        # Daily bar D covers [D, D+1). Keep days that overlap [start_at, now].
+        if date + ONE_DAY <= start_at or date >= now:
+            continue
         target, signal_detail = target_for_day(date, signals, previous_weights, R92, leverage)
         if not signal_detail.get("tradable", False):
             continue
-        date = pd.Timestamp(date)
         validation_assets = set(target) | {"BTC-USDT-SWAP"}
         if any(
             inst_id not in hourly
@@ -482,7 +630,9 @@ def simulate(
             for inst_id in validation_assets
         ):
             continue
-        result, detail = simulate_day(date, equity, target, previous_weights, hourly, atr, cost_rate)
+        result, detail = simulate_day(
+            date, equity, target, previous_weights, hourly, atr, funding, cost_rate
+        )
         equity = detail["endingEquity"]
         previous_weights = detail["endingWeights"]
         rows.append({"date": date, **result})
@@ -499,61 +649,83 @@ def simulate(
             }
         )
     if not rows:
-        return pd.DataFrame(columns=["net", "price", "cost", "endGross"]), []
+        return pd.DataFrame(columns=["net", "price", "funding", "cost", "endGross"]), []
     frame = pd.DataFrame(rows).set_index("date").sort_index()
     return frame, days
 
 
-def window_metrics(frame: pd.DataFrame, days: int, cost_rate: float = BASE_COST) -> dict[str, Any] | None:
+def window_metrics(frame: pd.DataFrame, principal: float, cost_rate: float = BASE_COST) -> dict[str, Any] | None:
     if frame.empty:
         return None
-    sample = frame[frame.index > frame.index.max() - timedelta(days=days)].copy()
-    if sample.empty:
-        return None
+    sample = frame.copy()
     liquidation_cost = float(sample.iloc[-1]["endGross"] * cost_rate)
     sample.loc[sample.index[-1], "net"] -= liquidation_cost
     sample.loc[sample.index[-1], "cost"] += liquidation_cost
     growth = (1.0 + sample["net"].fillna(0.0)).cumprod()
-    equity = STARTING_EQUITY * growth
+    equity = principal * growth
     drawdown = growth / growth.cummax().clip(lower=1.0) - 1.0
+    funding_col = sample["funding"] if "funding" in sample.columns else 0.0
     return {
         "start": sample.index.min().isoformat(),
         "end": sample.index.max().isoformat(),
         "observations": int(len(sample)),
-        "totalReturn": float(equity.iloc[-1] / STARTING_EQUITY - 1.0),
+        "totalReturn": float(equity.iloc[-1] / principal - 1.0),
         "maxDrawdown": float(drawdown.min()) if len(drawdown) else 0.0,
         "positiveDayShare": float((sample["net"] > 0).mean()),
         "endingEquity": float(equity.iloc[-1]),
+        "fundingReturn": float(funding_col.sum()) if not isinstance(funding_col, float) else 0.0,
+        "costReturn": float(sample["cost"].sum()),
     }
 
 
-def evaluate(hourly: dict[str, pd.DataFrame], leverage: float, window_days: int) -> dict[str, Any]:
+def evaluate(
+    hourly: dict[str, pd.DataFrame],
+    leverage: float,
+    window_days: int,
+    principal: float = DEFAULT_PRINCIPAL,
+    funding: dict[str, pd.Series] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    clock = pd.Timestamp(now or datetime.now(timezone.utc))
+    if clock.tzinfo is None:
+        clock = clock.tz_localize("UTC")
+    else:
+        clock = clock.tz_convert("UTC")
+    start_at = clock - timedelta(days=window_days)
     daily, closes = build_daily_inputs(hourly)
-    frame, days = simulate(hourly, daily, closes, leverage)
-    metrics = window_metrics(frame, window_days)
+    frame, days = simulate(hourly, daily, closes, leverage, principal, start_at, funding)
+    metrics = window_metrics(frame, principal)
     if metrics is None:
-        raise RuntimeError("缓存的K线还不够形成一个完整交易日，请再点一次补数据")
+        raise RuntimeError("这个时间窗口里还没有完整交易日，请再点一次补数据")
     return {
         "metrics": metrics,
-        "recentDays": days[-14:],
+        "recentDays": days[-14:] if window_days > 14 else days,
         "tradedDays": int(len(frame)),
+        "startAt": start_at.isoformat(),
     }
 
 
-def run_backtest(leverage: float, window: str, budget_seconds: float = BUDGET_SECONDS) -> dict[str, Any]:
+def run_backtest(
+    leverage: float,
+    window: str,
+    principal: float = DEFAULT_PRINCIPAL,
+    budget_seconds: float = BUDGET_SECONDS,
+) -> dict[str, Any]:
     if window not in WINDOWS:
         raise ValueError("window 只能是 week 或 year")
     leverage = clamp_leverage(leverage)
+    principal = clamp_principal(principal)
     window_days = WINDOWS[window]
     if not _LOCK.acquire(blocking=False):
         return {"ok": False, "busy": True, "error": "已有一次回测在跑，请等它结束再点"}
     started = time.monotonic()
     try:
         universe = load_universe()
-        # Leave roughly half the budget for the actual simulation.
         fetch_deadline = started + max(8.0, budget_seconds * 0.55)
         cache = sync_cache(universe, fetch_deadline)
         hourly = load_hourly_from_cache(universe)
+        funding = load_funding_from_cache(universe)
+        funding_rows = sum(0 if series.empty else int(series.notna().sum()) for series in funding.values())
         if len(hourly) < 6:
             return {
                 "ok": False,
@@ -572,17 +744,23 @@ def run_backtest(leverage: float, window: str, budget_seconds: float = BUDGET_SE
                 "cache": cache,
                 "elapsedSec": round(time.monotonic() - started, 2),
             }
-        result = evaluate(hourly, leverage, window_days)
+        result = evaluate(hourly, leverage, window_days, principal, funding)
         payload = {
             "ok": True,
             "busy": False,
             "leverage": leverage,
+            "principal": principal,
             "window": window,
             "windowDays": window_days,
-            "fundingIncluded": False,
+            "fundingIncluded": funding_rows > 0,
             "cache": cache,
             "elapsedSec": round(time.monotonic() - started, 2),
-            "note": "K线增量缓存最多一年；未计入资金费。一周回测仍用更长历史做排名热身。",
+            "note": (
+                "从一周前此刻空仓起步到现在。"
+                if window == "week"
+                else "从一年前此刻空仓起步到现在（K线最多缓存一年，热身期会吃掉前面约40天）。"
+            )
+            + "含开平仓手续费和资金费。",
             **result,
         }
         last_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
