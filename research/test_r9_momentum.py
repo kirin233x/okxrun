@@ -6,17 +6,19 @@ import pandas as pd
 
 from research.r9_momentum_backtest import (
     BASE_COST,
-    MAX_ASSET_WEIGHT,
     Position,
+    load_universe,
+    simulate_day,
+    stop_fill,
+)
+from strategy import (
+    MAX_ASSET_WEIGHT,
     R91,
     R92,
     apply_rebalance_threshold,
     buffered_selection,
     capped_inverse_vol_weights,
-    load_universe,
     scale_target_weights,
-    simulate_day,
-    stop_fill,
 )
 
 

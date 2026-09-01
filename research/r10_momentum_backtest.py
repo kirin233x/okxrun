@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,6 +11,26 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+# See the equivalent note in r9_momentum_backtest.py: direct invocation puts
+# research/ on sys.path, so the repo root has to be restored for `strategy`.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from strategy import (  # noqa: E402
+    ASSETS_PER_SIDE,
+    BTC_SHOCK_Z,
+    DAILY_KILL_LOSS,
+    MAX_STOP,
+    MIN_STOP,
+    RANK_EXIT_BUFFER,
+    STOP_ATR_MULTIPLIER,
+    TRAIL_DISTANCE,
+    TRAIL_TRIGGER,
+    buffered_selection,
+    compute_signals,
+)
 
 try:
     from .high_return_candidates import (
@@ -21,21 +42,10 @@ try:
         funding_series,
     )
     from .r9_momentum_backtest import (
-        ASSETS_PER_SIDE,
-        BTC_SHOCK_Z,
-        DAILY_KILL_LOSS,
-        MAX_STOP,
-        MIN_STOP,
         ONE_DAY,
-        RANK_EXIT_BUFFER,
-        STOP_ATR_MULTIPLIER,
-        TRAIL_DISTANCE,
-        TRAIL_TRIGGER,
         Position,
-        buffered_selection,
         build_daily_inputs,
         close_position,
-        compute_signals,
         load_hourly,
         load_universe,
         metrics,
@@ -52,21 +62,10 @@ except ImportError:
         funding_series,
     )
     from r9_momentum_backtest import (
-        ASSETS_PER_SIDE,
-        BTC_SHOCK_Z,
-        DAILY_KILL_LOSS,
-        MAX_STOP,
-        MIN_STOP,
         ONE_DAY,
-        RANK_EXIT_BUFFER,
-        STOP_ATR_MULTIPLIER,
-        TRAIL_DISTANCE,
-        TRAIL_TRIGGER,
         Position,
-        buffered_selection,
         build_daily_inputs,
         close_position,
-        compute_signals,
         load_hourly,
         load_universe,
         metrics,
