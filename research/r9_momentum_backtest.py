@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,24 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+# Running this file directly puts research/ on sys.path, not the repo root, so
+# the shared strategy package needs the root added back before it can import.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from strategy import (  # noqa: E402
+    DAILY_KILL_LOSS,
+    R9,
+    R91,
+    R92,
+    StrategyVariant,
+    compute_signals,
+    stop_fraction_from_atr,
+    stop_price,
+    target_for_day,
+)
 
 try:
     from .high_return_candidates import (
@@ -41,50 +60,7 @@ OUTPUT = ROOT / "research" / "artifacts" / "r9-momentum-report.json"
 R91_OUTPUT = ROOT / "research" / "artifacts" / "r9.1-momentum-report.json"
 R92_OUTPUT = ROOT / "research" / "artifacts" / "r9.2-momentum-report.json"
 HOURLY_DAYS = 420
-LONG_FORMATION_DAYS = 30
-SHORT_FORMATION_DAYS = 7
-HIGH_LOOKBACK_DAYS = 20
-VOLATILITY_DAYS = 20
-ASSETS_PER_SIDE = 3
-MAX_ASSET_WEIGHT = 0.20
-BTC_SHOCK_Z = 1.5
-STOP_ATR_MULTIPLIER = 1.5
-MIN_STOP = 0.03
-MAX_STOP = 0.06
-TRAIL_TRIGGER = 0.04
-TRAIL_DISTANCE = 0.025
-DAILY_KILL_LOSS = 0.03
-RANK_EXIT_BUFFER = 6
-MIN_REBALANCE_DELTA = 0.05
-R92_RANK_EXIT_BUFFER = 8
-R92_MIN_REBALANCE_DELTA = 0.10
 ONE_DAY = timedelta(days=1)
-
-
-@dataclass(frozen=True)
-class StrategyVariant:
-    id: str
-    name: str
-    up_shock_flat: bool = False
-    rank_exit_buffer: int = 0
-    min_rebalance_delta: float = 0.0
-
-
-R9 = StrategyVariant("r9", "R9 基线")
-R91 = StrategyVariant(
-    "r9.1",
-    "R9.1 暴涨回避 + 排名缓冲 + 调仓阈值",
-    up_shock_flat=True,
-    rank_exit_buffer=RANK_EXIT_BUFFER,
-    min_rebalance_delta=MIN_REBALANCE_DELTA,
-)
-R92 = StrategyVariant(
-    "r9.2",
-    "R9.2 扩大排名缓冲 + 提高调仓阈值",
-    up_shock_flat=True,
-    rank_exit_buffer=R92_RANK_EXIT_BUFFER,
-    min_rebalance_delta=R92_MIN_REBALANCE_DELTA,
-)
 
 
 @dataclass
@@ -157,196 +133,18 @@ def load_funding(universe: list[str]) -> dict[str, pd.Series]:
     return result
 
 
-def cross_sectional_rank(frame: pd.DataFrame) -> pd.DataFrame:
-    return frame.rank(axis=1, pct=True, method="average")
-
-
-def compute_signals(closes: pd.DataFrame, daily: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame | pd.Series]:
-    returns = closes.pct_change(fill_method=None)
-    return_30 = closes.pct_change(LONG_FORMATION_DAYS, fill_method=None).shift(1)
-    return_7 = closes.pct_change(SHORT_FORMATION_DAYS, fill_method=None).shift(1)
-    prior_close = closes.shift(1)
-    prior_high = closes.rolling(HIGH_LOOKBACK_DAYS).max().shift(1)
-    near_high = prior_close / prior_high - 1.0
-    score = (
-        0.60 * cross_sectional_rank(return_30)
-        + 0.25 * cross_sectional_rank(return_7)
-        + 0.15 * cross_sectional_rank(near_high)
+def position_stop_price(position: Position) -> float:
+    return stop_price(
+        position.entry,
+        position.direction,
+        position.stop_fraction,
+        position.peak,
+        position.trough,
     )
-    volatility = returns.rolling(VOLATILITY_DAYS).std(ddof=0).shift(1)
-
-    atr_percent: dict[str, pd.Series] = {}
-    for inst_id, frame in daily.items():
-        previous_close = frame["close"].shift(1)
-        true_range = pd.concat(
-            [
-                frame["high"] - frame["low"],
-                (frame["high"] - previous_close).abs(),
-                (frame["low"] - previous_close).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
-        atr_percent[inst_id] = (true_range / previous_close).rolling(VOLATILITY_DAYS).mean().shift(1)
-    atr = pd.concat(atr_percent, axis=1).reindex(closes.index)
-
-    btc = "BTC-USDT-SWAP"
-    btc_prior = closes[btc].shift(1)
-    btc_ma = closes[btc].rolling(20).mean().shift(1)
-    btc_return_1 = returns[btc].shift(1)
-    btc_return_7 = closes[btc].pct_change(7, fill_method=None).shift(1)
-    btc_vol = returns[btc].rolling(20).std(ddof=0).shift(1)
-    btc_shock_z = btc_return_1 / btc_vol.replace(0, np.nan)
-    return {
-        "score": score,
-        "volatility": volatility,
-        "atr": atr,
-        "btcPrior": btc_prior,
-        "btcMa": btc_ma,
-        "btcReturn1": btc_return_1,
-        "btcReturn7": btc_return_7,
-        "btcShockZ": btc_shock_z,
-    }
-
-
-def capped_inverse_vol_weights(volatility: pd.Series, gross: float) -> dict[str, float]:
-    valid = volatility.replace([np.inf, -np.inf], np.nan).dropna()
-    valid = valid[valid > 0]
-    if valid.empty or gross <= 0:
-        return {}
-    raw = (1.0 / valid) / (1.0 / valid).sum() * gross
-    capped = raw.clip(upper=MAX_ASSET_WEIGHT)
-    return {str(inst_id): float(weight) for inst_id, weight in capped.items() if weight > 0}
-
-
-def buffered_selection(
-    ranked: pd.Series,
-    previous_weights: dict[str, float],
-    exit_buffer: int = RANK_EXIT_BUFFER,
-) -> tuple[list[str], list[str]]:
-    ascending = list(ranked.index)
-    descending = list(reversed(ascending))
-    long_buffer = set(descending[:exit_buffer])
-    short_buffer = set(ascending[:exit_buffer])
-    retained_longs = [inst_id for inst_id in descending if previous_weights.get(inst_id, 0.0) > 0 and inst_id in long_buffer]
-    retained_shorts = [inst_id for inst_id in ascending if previous_weights.get(inst_id, 0.0) < 0 and inst_id in short_buffer]
-
-    longs = retained_longs[:ASSETS_PER_SIDE]
-    shorts = retained_shorts[:ASSETS_PER_SIDE]
-    longs.extend(inst_id for inst_id in descending if inst_id not in longs and len(longs) < ASSETS_PER_SIDE)
-    shorts.extend(inst_id for inst_id in ascending if inst_id not in shorts and len(shorts) < ASSETS_PER_SIDE)
-    return longs, shorts
-
-
-def apply_rebalance_threshold(
-    target: dict[str, float],
-    previous_weights: dict[str, float],
-    threshold: float,
-) -> dict[str, float]:
-    if threshold <= 0:
-        return target
-    adjusted: dict[str, float] = {}
-    for inst_id, proposed in target.items():
-        previous = previous_weights.get(inst_id, 0.0)
-        same_side = previous * proposed > 0
-        if same_side and abs(proposed - previous) < threshold:
-            retained = math.copysign(min(abs(previous), MAX_ASSET_WEIGHT), proposed)
-            adjusted[inst_id] = retained
-        else:
-            adjusted[inst_id] = proposed
-    gross = sum(abs(weight) for weight in adjusted.values())
-    if gross > 1.0:
-        adjusted = {inst_id: weight / gross for inst_id, weight in adjusted.items()}
-    return adjusted
-
-
-def scale_target_weights(target: dict[str, float], leverage: float) -> dict[str, float]:
-    if not math.isfinite(leverage) or leverage <= 0:
-        raise ValueError("leverage must be a positive finite number")
-    return {inst_id: weight * leverage for inst_id, weight in target.items()}
-
-
-def target_for_day(
-    date: pd.Timestamp,
-    signals: dict[str, pd.DataFrame | pd.Series],
-    previous_weights: dict[str, float] | None = None,
-    variant: StrategyVariant = R9,
-    leverage: float = 1.0,
-) -> tuple[dict[str, float], dict[str, Any]]:
-    previous_weights = previous_weights or {}
-    normalized_previous = {inst_id: weight / leverage for inst_id, weight in previous_weights.items()}
-    score = signals["score"].loc[date].dropna()  # type: ignore[union-attr]
-    volatility = signals["volatility"].loc[date].reindex(score.index).dropna()  # type: ignore[union-attr]
-    ranked = score.reindex(volatility.index).dropna().sort_values()
-    if len(ranked) < ASSETS_PER_SIDE * 2:
-        return {}, {"regime": "INSUFFICIENT_DATA", "tradable": False}
-    if variant.rank_exit_buffer:
-        longs, shorts = buffered_selection(ranked, normalized_previous, variant.rank_exit_buffer)
-    else:
-        shorts = list(ranked.index[:ASSETS_PER_SIDE])
-        longs = list(ranked.index[-ASSETS_PER_SIDE:])
-    btc_prior = float(signals["btcPrior"].loc[date])  # type: ignore[union-attr]
-    btc_ma = float(signals["btcMa"].loc[date])  # type: ignore[union-attr]
-    btc_return_1 = float(signals["btcReturn1"].loc[date])  # type: ignore[union-attr]
-    btc_return_7 = float(signals["btcReturn7"].loc[date])  # type: ignore[union-attr]
-    btc_shock_z = float(signals["btcShockZ"].loc[date])  # type: ignore[union-attr]
-    if not all(math.isfinite(value) for value in (btc_prior, btc_ma, btc_return_1, btc_return_7, btc_shock_z)):
-        return {}, {"regime": "INSUFFICIENT_BTC_DATA", "tradable": False}
-
-    if btc_shock_z > BTC_SHOCK_Z and variant.up_shock_flat:
-        long_gross, short_gross = 0.0, 0.0
-        regime = "UP_SHOCK_FLAT"
-    elif abs(btc_shock_z) > BTC_SHOCK_Z:
-        long_gross, short_gross = (1.0, 0.0) if btc_return_1 > 0 else (0.0, 1.0)
-        regime = "UP_SHOCK" if btc_return_1 > 0 else "DOWN_SHOCK"
-    elif btc_prior > btc_ma and btc_return_7 > 0:
-        long_gross, short_gross = 0.75, 0.25
-        regime = "UP_TREND"
-    elif btc_prior < btc_ma and btc_return_7 < 0:
-        long_gross, short_gross = 0.25, 0.75
-        regime = "DOWN_TREND"
-    else:
-        long_gross, short_gross = 0.50, 0.50
-        regime = "NEUTRAL"
-
-    long_weights = capped_inverse_vol_weights(volatility.reindex(longs), long_gross)
-    short_weights = capped_inverse_vol_weights(volatility.reindex(shorts), short_gross)
-    normalized_target = long_weights | {inst_id: -weight for inst_id, weight in short_weights.items()}
-    normalized_target = apply_rebalance_threshold(
-        normalized_target,
-        normalized_previous,
-        variant.min_rebalance_delta,
-    )
-    target = scale_target_weights(normalized_target, leverage)
-    detail = {
-        "regime": regime,
-        "tradable": True,
-        "variant": variant.id,
-        "btcReturn1": btc_return_1,
-        "btcReturn7": btc_return_7,
-        "btcShockZ": btc_shock_z,
-        "leverage": leverage,
-        "longGrossTarget": long_gross * leverage,
-        "shortGrossTarget": short_gross * leverage,
-        "grossAfterCap": float(sum(abs(weight) for weight in target.values())),
-        "longs": longs,
-        "shorts": shorts,
-        "rankBuffer": variant.rank_exit_buffer or None,
-        "minRebalanceDelta": variant.min_rebalance_delta,
-    }
-    return target, detail
-
-
-def stop_price(position: Position) -> float:
-    fixed = position.entry * (1.0 - position.direction * position.stop_fraction)
-    if position.direction > 0 and position.peak >= position.entry * (1.0 + TRAIL_TRIGGER):
-        return max(fixed, position.peak * (1.0 - TRAIL_DISTANCE))
-    if position.direction < 0 and position.trough <= position.entry * (1.0 - TRAIL_TRIGGER):
-        return min(fixed, position.trough * (1.0 + TRAIL_DISTANCE))
-    return fixed
 
 
 def stop_fill(position: Position, bar: pd.Series) -> float | None:
-    stop = stop_price(position)
+    stop = position_stop_price(position)
     if position.direction > 0:
         if float(bar["open"]) <= stop:
             return float(bar["open"])
@@ -393,7 +191,7 @@ def simulate_day(
         notional = starting_equity * abs(weight)
         if notional <= 0 or entry <= 0:
             continue
-        stop_fraction = float(np.clip(STOP_ATR_MULTIPLIER * float(atr.loc[date, inst_id]), MIN_STOP, MAX_STOP))
+        stop_fraction = stop_fraction_from_atr(float(atr.loc[date, inst_id]))
         if not math.isfinite(stop_fraction):
             continue
         positions[inst_id] = Position(
