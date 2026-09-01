@@ -25,6 +25,7 @@ from strategy import (  # noqa: E402
     R91,
     R92,
     StrategyVariant,
+    build_daily_inputs,
     compute_signals,
     stop_fraction_from_atr,
     stop_price,
@@ -106,24 +107,6 @@ def load_hourly(universe: list[str], refresh: bool) -> dict[str, pd.DataFrame]:
     return frames
 
 
-def daily_from_hourly(frame: pd.DataFrame) -> pd.DataFrame:
-    count = frame["close"].resample("1D").count()
-    daily = frame.resample("1D").agg(
-        open=("open", "first"),
-        high=("high", "max"),
-        low=("low", "min"),
-        close=("close", "last"),
-        volumeQuote=("volumeQuote", "sum"),
-    )
-    return daily[count >= 23].dropna(subset=["open", "high", "low", "close"])
-
-
-def build_daily_inputs(hourly: dict[str, pd.DataFrame]) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
-    daily = {inst_id: daily_from_hourly(frame) for inst_id, frame in hourly.items()}
-    closes = pd.concat({inst_id: frame["close"] for inst_id, frame in daily.items()}, axis=1).sort_index()
-    return daily, closes
-
-
 def load_funding(universe: list[str]) -> dict[str, pd.Series]:
     result: dict[str, pd.Series] = {}
     for inst_id in universe:
@@ -180,7 +163,7 @@ def simulate_day(
     positions: dict[str, Position] = {}
     entry_cost_by_asset = {
         inst_id: starting_equity * abs(target.get(inst_id, 0.0) - previous_weights.get(inst_id, 0.0)) * cost_rate
-        for inst_id in set(target) | set(previous_weights)
+        for inst_id in sorted(set(target) | set(previous_weights))
     }
     entry_cost = float(sum(entry_cost_by_asset.values()))
     for inst_id, weight in target.items():
@@ -251,7 +234,7 @@ def simulate_day(
             positions[inst_id].direction
             * positions[inst_id].quantity
             * (last_marks[inst_id] - positions[inst_id].entry)
-            for inst_id in active
+            for inst_id in sorted(active)
         )
         marked_equity = starting_equity + realized + unrealized + funding_pnl - paid_cost
         if active and marked_equity <= starting_equity * (1.0 - DAILY_KILL_LOSS):
@@ -261,7 +244,7 @@ def simulate_day(
             kill_triggered = True
             break
 
-    carried = list(active)
+    carried = sorted(active)
     for inst_id in carried:
         position = positions[inst_id]
         position.exit_price = last_marks[inst_id]
@@ -277,7 +260,7 @@ def simulate_day(
         for inst_id in carried
         if ending_equity > 0
     }
-    rebalance_turnover = sum(abs(target.get(inst_id, 0.0) - previous_weights.get(inst_id, 0.0)) for inst_id in set(target) | set(previous_weights))
+    rebalance_turnover = sum(abs(target.get(inst_id, 0.0) - previous_weights.get(inst_id, 0.0)) for inst_id in sorted(set(target) | set(previous_weights)))
     stopped_turnover = sum(
         abs(position.quantity * float(position.exit_price or position.entry)) / starting_equity
         for position in positions.values()
@@ -295,7 +278,7 @@ def simulate_day(
     }, {
         "trades": sum(
             abs(target.get(inst_id, 0.0) - previous_weights.get(inst_id, 0.0)) > 1e-8
-            for inst_id in set(target) | set(previous_weights)
+            for inst_id in sorted(set(target) | set(previous_weights))
         ) + stop_count,
         "stops": stop_count,
         "killTriggered": kill_triggered,

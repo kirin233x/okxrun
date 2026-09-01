@@ -8,6 +8,7 @@ account: every function is pure, given already-loaded price frames.
 
 from __future__ import annotations
 
+from .bars import build_daily_inputs, daily_from_hourly
 from .config import (
     ASSETS_PER_SIDE,
     BTC_INSTRUMENT,
@@ -67,9 +68,11 @@ __all__ = [
     "VOLATILITY_DAYS",
     "apply_rebalance_threshold",
     "buffered_selection",
+    "build_daily_inputs",
     "capped_inverse_vol_weights",
     "compute_signals",
     "cross_sectional_rank",
+    "daily_from_hourly",
     "scale_target_weights",
     "stop_fraction_from_atr",
     "stop_price",
